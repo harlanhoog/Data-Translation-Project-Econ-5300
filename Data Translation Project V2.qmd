@@ -1,0 +1,253 @@
+---
+title: "Data Translation Project:
+The Effect of Harsher Punishments for Drunk Driving on Recidivism"
+author: "Ana, Aphiwad, Harlan, Kavya, Mohomaed and Ulsbold"
+format: docx
+editor: visual
+echo: false
+---
+
+## 1. Introduction
+
+Since 1985, over 400,000 people have died from drunk driving accidents in the United States. These fatalities make up over 30% of total traffic fatalities. With these numbers in mind, naturally we would want to determine whether punishments for drunk driving are actually doing their job and reducing the amount of repeat offenders. In this study, we will look at how effective drunk driving sanctions are in reducing recidivism by using a regression discontinuity design to examine those right around the .08 threshold of a DUI.
+
+```{r}
+## import libraries
+library(vtable)
+library(tidyverse)
+library(fixest)
+library(rio)
+library(lubridate)
+library(ggplot2)
+library(rdrobust)
+```
+
+## 2. Description of The Data
+
+This data set is derived from administrative records on DUI stops from Washington State and includes 214,558 observations. Each driver in the data was tested for their blood alcohol concentration (BAC) levels after they were stopped, two tests are administered each time to determine accuracy and every test is measured with three decimals. Also, the breathalyzer tests given in traffic stops vary quite a bit from portable breathalyzers the average person might have bought making the outcome of a test very hard to manipulate for the driver. The threshold for a driver receiving a DUI (which comes with fines, jail time and license suspension) is a BAC of .08. There is also another threshold of .15 which comes with harsher penalties for the driver. Because of these clear cut thresholds for punishment, and assuming the data was not manipulated we can apply a regression discontinuity design as drivers just above and below the cutoff are similar in most respects except for the severity of the punishment the receive.
+
+Below, we have each variable in the data set along with some summary statistics to provide us with a quick overview of what we are working with.
+
+```{r}
+## import dataset
+dwi <- import('DWI_Data.rdata')
+
+## show variables, we can see the variable classes are correct here
+vtable(dwi)
+
+## summary statistics
+summary(dwi)
+## from looking at the summary statistics there are no outliers we are going to take out.
+## although there are very high bac values, they are conceivable
+```
+
+The outcome variable in this study is recidivism, which measures whether a driver commits another drunk-driving offense after the initial traffic stop. The key explanatory variable is the driver’s BAC level relative to the legal thresholds. 
+
+Looking at the summary statistics above, a few things stand out. The average BAC level in the sample is 0.139, which is well above the legal limit of 0.08, reflecting the fact that the sample consists of drivers suspected of drunk driving. Approximately 79% of drivers in the data set are male and 86% are white. The average driver age is approximately 35 years. About 11.8% of drivers commit another drunk-driving offense after the initial stop, while roughly 14.7% of stops involve an accident.
+
+We can also do a quick check for any outliers here. The maximum for the BAC tests are very high but are also in the realm of possibility. Since they match up with the maximum values for the alcohol tests, we concluded that these values are most likely not a mistake so we kept them in our data.
+
+Before implementing the Regression Discontinuity Design, we perform several data preparation and exploratory analysis steps to better understand the structure of the dataset and ensure that the running variable (BAC) is properly constructed. 
+
+In the next section, we describe the data cleaning procedures and the construction of the main variables used in the analysis. 
+
+## 3. Data Cleaning and Variable Construction
+
+The first decision we made was in how to handle the two BAC tests (bac1 and bac2). Here we chose to construct the running variable using the minimum of the two BAC measurements. This choice reflects the legal procedure used in determining DUI guilt, where the lower BAC reading determines whether a driver exceeds the legal threshold as they must be proved guilty beyond a reasonable doubt.
+
+The date values in our data were originally characters so we changed these values to dates. While doing this we also extracted the month in case we wanted to control for seasonality.
+
+```{r}
+## Fix date variable and extract month
+dwi_clean <- dwi %>%
+  mutate(
+    # Parse the date correctly
+    date_parsed = dmy(Date),
+    
+    # Month for seasonality
+    month = month(date_parsed))
+
+## Create variable (bac_min) that is the minimum of the two bac tests - this is our running variable
+dwi_clean <- dwi_clean %>% mutate( bac_min = pmin(bac1, bac2) )
+```
+
+Next, we created a subset with just the variables that were relevant to our study. We also did a check to look for any missing values.
+
+```{r}
+## Create subset for just variables we are going to use
+small_dwi <- dwi_clean %>%
+  select(male, white, recidivism, acc, aged, year, bac_min, month)
+
+## Ensure no missing values
+small_dwi %>%
+  summarise(
+    share_missing_male = sum(is.na(male)), ## check sum of NA values
+    share_missing_white = sum(is.na(white)),
+    share_missing_recidivism = sum(is.na(recidivism)),
+    share_missing_acc = sum(is.na(acc)),
+    share_missing_aged = sum(is.na(aged)),
+    share_missing_year = sum(is.na(year)),
+    share_missing_bac_min = sum(is.na(bac_min)),
+    share_missing_month = sum(is.na(month))
+  )
+```
+
+**Treatment variable:** 
+
+The BAC threshold for a suspected drunk driver receiving a DUI is:
+
+-   BAC = 0.08
+
+Therefore we created the running variable: 
+
+-   bac_08_or_over: equals 1 if BAC ≥ 0.08 
+
+This indicator represent whether a driver is exposed to harsher legal penalties or not.
+
+In addition, we created a centered running variable (bac_08_centered) by subtracting the cutoff values from the BAC measure. Centering the running variable simplifies the interpretation of the RDD model, because the cutoff occurs at zero. 
+
+```{r}
+## Create treatment and running variables for analysis
+small_dwi <- small_dwi %>%
+  mutate(
+    bac_08_or_over = bac_min >= 0.08,
+    bac_08_centered = bac_min - 0.08
+  )
+```
+
+## 4. Exploratory Data Analysis
+
+Before estimating our regression models, we explore the structure of the data using graphical analysis. These graphs will help us further understand the distribution of the running variable and evaluate whether the assumptions we need to make for RDD hold up.
+
+```{r}
+## Scatter plot: bac1 vs bac2 (check alignment of two tests)
+ggplot(dwi_clean, aes(x = bac1, y = bac2)) +
+  geom_point(alpha = 0.15) +
+  geom_abline(slope = 1, intercept = 0) +
+  labs(
+    title = "BAC Test 1 vs BAC Test 2",
+    x = "BAC test 1 (bac1)",
+    y = "BAC test 2 (bac2)"
+  )
+
+dwi_clean %>%
+  summarise(
+    mean1 = mean(bac1),
+    mean2 = mean(bac2),
+    mean1-mean2
+  )
+```
+
+**Figure 1:** Relationship Between the Two BAC Tests 
+
+This graph assesses the consistency between the two BAC measurements. The scatter plot (Figure 1) shows that the two measurements are highly correlated, with observations closely aligned along the 45-degree line. This indicates that the two tests produce very similar readings, suggesting minimal measurement discrepancies between them. Furthermore, we calculated the means of the two BAC tests and the difference is just .00069, showing these two tests are basically the same, especially when we consider the actual test only goes out to three decimal places.
+
+## 4.1 Distribution of the Running Variable
+
+A key concern in Regression Discontinuity Design is the potential manipulation of the running variable near the threshold. If drivers were able to manipulate their BAC levels to remain below the legal cutoff, the identification strategy could be compromised. To assess this possibility, we examine the distribution of BAC values using a histogram of the running variable. If manipulation were present, we would expect to observe an abnormal concentration of observations just below the threshold values.
+
+```{r}
+## Distribution of the running variable
+# Histogram of bac_min with cutoffs
+ggplot(small_dwi, aes(x = bac_min)) +
+  geom_histogram(binwidth = 0.005) +
+  geom_vline(xintercept = 0.08, linetype = "dashed")
+  labs(
+    title = "Distribution of BAC (Running Variable: bac_min)",
+    x = "BAC (bac_min)",
+    y = "Frequency"
+  )
+```
+
+**Figure 2:** Distribution of the Running Variable 
+
+Figure 2 shows the distribution of the running variables with the thresholds marked by dotted lines. This histogram reveals a smooth distribution of BAC values around the legal threshold of 0.08. Most importantly, there is no visible evidence of bunching just below the cutoff, which would have suggested manipulation of the running variable. The absence of such discontinuities supports the validity of the Regression Discontinuity Design assumption that individuals cannot precisely manipulate their BAC levels relative to the legal threshold.
+
+## 4.2 Covariate Balance checks
+
+Another key assumption of the RDD framework is that individuals just above and below the cutoff are similar in observable and unobservable characteristics. To assess this assumption, we examine whether the variables in our data: age, gender, race, and accident involvement 'jump' around the cutoff.
+
+To conduct this check, we focus on observations close to the 0.08 cutoff, specifically drivers with BAC values between 0.03 and 0.13. Within this range, we group BAC values into small intervals of width 0.005 and compute the average value of each covariate within these intervals. Plotting these averages allows us to observe how driver characteristics change as BAC approaches the legal threshold and to check whether any sudden changes occur at the cutoff.
+
+```{r}
+# Restrict to a window around the 0.08 cutoff for visualization
+near08 <- small_dwi %>%
+  filter(bac_min >= 0.03, bac_min <= 0.13)
+
+
+## Create bins for for scatterplots, groups continuous bac values into discrete bins of .0005
+near08_binned <- near08 %>%
+  mutate(bin = floor(bac_min / 0.005) * 0.005) %>% ## binning calculation for bins sized .0005
+  group_by(bin) %>% ## performs the binning calculation for eeach group seperately
+  summarise(
+    mean_age = mean(aged),
+    share_male = mean(male),
+    share_white = mean(white),
+    share_acc = mean(acc),
+    observations = n(),
+    .groups = "drop"
+  )
+
+# Age around cutoff
+ggplot(near08_binned, aes(x = bin, y = mean_age)) +
+  geom_point() +
+  geom_vline(xintercept = 0.08, linetype = "dashed") +
+  labs(
+    title = "Mean Age Around the 0.08 Cutoff (Binned)",
+    x = "BAC (binned)",
+    y = "Mean age"
+  )
+
+# Share male around cutoff
+ggplot(near08_binned, aes(x = bin, y = share_male)) +
+  geom_point() +
+  geom_vline(xintercept = 0.08, linetype = "dashed") +
+  labs(
+    title = "Share Male Around the 0.08 Cutoff (Binned)",
+    x = "BAC (binned)",
+    y = "Share male"
+  )
+
+# Share white around cutoff
+ggplot(near08_binned, aes(x = bin, y = share_white)) +
+  geom_point() +
+  geom_vline(xintercept = 0.08, linetype = "dashed") +
+  labs(
+    title = "Share White Around the 0.08 Cutoff (Binned)",
+    x = "BAC (binned)",
+    y = "Share white"
+  )
+
+# Accident involvement around cutoff
+ggplot(near08_binned, aes(x = bin, y = share_acc)) +
+  geom_point() +
+  geom_vline(xintercept = 0.08, linetype = "dashed") +
+  labs(
+    title = "Accident at the Scene Around the 0.08 Cutoff (Binned)",
+    x = "BAC (binned)",
+    y = "Share with accident"
+  )
+```
+
+Figures 3–6 present the binned averages of these covariates around the 0.08 BAC threshold. In all cases, the covariates evolve smoothly across the cutoff, with no visible discontinuities at the legal threshold. 
+
+Overall, these results suggest that drivers just below and just above the cutoff are similar in observable characteristics. This supports the key RDD assumption that treatment assignment near the threshold is effectively random and provides evidence for the validity of the Regression Discontinuity Design. 
+
+## 4.3 Functional Form
+
+For the last part of our EDA, we wanted to determine what functional form the model should take.
+
+```{r}
+## Use rdplot to determine the functional form
+rdplot(y = small_dwi$recidivism, 
+       x = small_dwi$bac_min, 
+       c = 0.08,             # The BAC legal limit cutoff
+       p = 2,                # 1 = Linear line, 2 = Quadratic curve
+       title = "Binned Scatterplot: Recidivism by BAC",
+       x.label = "Blood Alcohol Content (BAC)",
+       y.label = "Recidivism Rate")
+```
+
+**Figure 7:** Binned scatterplot for recidivism by BAC
+
+Looking at Figure 7 we can see that, especially on the right side of the data, the scatterplot is not linearly distributed and could benefit from using a polynomial.
